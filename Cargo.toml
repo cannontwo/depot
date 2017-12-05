@@ -7,3 +7,13 @@ authors = ["cannon <cannon10100@gmail.com>"]
 lazy_static = "1.0.0"
 zmq = "0.8"
 time = "0.1"
+iron = "*"
+router = "*"
+serde = "*"
+serde_json = "*"
+serde_derive = "*"
+params = "*"
+
+[dependencies.uuid]
+version = "*"
+features = ["serde", "v4"]
