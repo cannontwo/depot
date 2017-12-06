@@ -13,6 +13,7 @@ extern crate serde;
 extern crate serde_json;
 extern crate params;
 extern crate protobuf;
+extern crate hyper;
 
 use std::sync::Mutex;
 use std::collections::HashMap;
@@ -26,6 +27,9 @@ use time::Duration;
 
 use iron::prelude::*;
 use iron::status;
+
+use hyper::header::{Headers, ContentType};
+use hyper::mime::{Mime, TopLevel, SubLevel};
 
 use router::Router;
 
@@ -112,7 +116,11 @@ lazy_static! {
 }
 
 fn hello_world(_: &mut Request) -> IronResult<Response> {
-    Ok(Response::with((status::Ok, "Hello World!")))
+    let mut resp = Response::with((status::Ok,
+                       "Hello! Check out <a href=\"/configs\">configs</a> \
+                       or <a href=\"/servers\">servers</a>"));
+    resp.headers.set(ContentType(Mime(TopLevel::Text, SubLevel::Html, vec![])));
+    Ok(resp)
 }
 
 // Handler for listing all configs
@@ -206,6 +214,7 @@ fn delete_config(req: &mut Request) -> IronResult<Response> {
     }
 }
 
+// Handler returning a JSON object storing all known servers.
 fn get_servers(req: &mut Request) -> IronResult<Response> {
     match SERVERS.lock() {
         Ok(guard) => Ok(Response::with((status::Ok, serde_json::to_string_pretty(&guard.deref()).unwrap()))),
@@ -213,6 +222,7 @@ fn get_servers(req: &mut Request) -> IronResult<Response> {
     }
 }
 
+// Handler returning a JSON object representing the requested server
 fn get_server(req: &mut Request) -> IronResult<Response> {
     let ref server_id = match req.extensions.get::<Router>().unwrap().find("server") {
         Some(val) => match Uuid::from_str(val) {
@@ -234,7 +244,7 @@ fn get_server(req: &mut Request) -> IronResult<Response> {
     }
 }
 
-// Start the web frontend for the dispatcher.
+// Start the web API for the dispatcher.
 fn start_web_server() {
     let mut router = Router::new();
 
@@ -252,6 +262,7 @@ fn start_web_server() {
     println!("Server started at port 3000");
 }
 
+// Handles new server connections by inserting the server into SERVERS.
 fn start_secretary() {
     let context = zmq::Context::new();
 
@@ -277,6 +288,7 @@ fn start_secretary() {
     }
 }
 
+// Collects reports from servers.
 fn start_sink() {
     let context = zmq::Context::new();
     let receiver = context.socket(zmq::PULL).unwrap();
