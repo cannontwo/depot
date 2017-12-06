@@ -13,7 +13,17 @@ serde = "*"
 serde_json = "*"
 serde_derive = "*"
 params = "*"
+protobuf = "*"
+hyper = "*"
 
 [dependencies.uuid]
 version = "*"
 features = ["serde", "v4"]
+
+[[bin]]
+name = "depot_dispatcher"
+path = "src/depot_dispatcher.rs"
+
+[[bin]]
+name = "depot_worker"
+path = "src/depot_worker.rs"
