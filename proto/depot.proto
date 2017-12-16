@@ -5,20 +5,19 @@ package depot;
 // Enum representing the type of message being sent.
 enum ServerMessageType {
     INIT = 0;
-    INIT_RESPONSE = 1;
-    CONFIG = 2;
-    REPORT = 3;
+    CONFIG = 1;
+    REPORT = 2;
+}
+
+// Message representing the type of the top-level message
+message TypeSignifier {
+    ServerMessageType type = 1;
 }
 
 // Message sent by worker sever to register with depot config dispatcher.
 message ServerInit {
     string name = 1;
     string ip = 2;
-}
-
-// Message sent by depot config dispatcher back to server in response to init message.
-message ServerInitResponse {
-    string server_uuid = 1;
 }
 
 // Message sent by depot config dispatcher to server with new config to process.

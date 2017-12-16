@@ -20,15 +20,15 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use std::thread;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::ops::Deref;
 use std::time::Instant;
-use time::Duration;
+use std::str;
 
 use iron::prelude::*;
 use iron::status;
 
-use hyper::header::{Headers, ContentType};
+use hyper::header::{ContentType};
 use hyper::mime::{Mime, TopLevel, SubLevel};
 
 use router::Router;
@@ -37,7 +37,6 @@ use params::{Params, Value};
 
 use uuid::Uuid;
 
-use protobuf::Message;
 use protobuf::core::parse_from_bytes;
 
 mod proto {
@@ -45,6 +44,15 @@ mod proto {
 }
 
 use proto::depot;
+
+const HEARTBEAT_LIVENESS: u64 = 3;
+const HEARTBEAT_INTERVAL: u64 = 10000;
+
+#[derive(Serialize, Deserialize, Debug)]
+enum ServerStatus {
+    ONLINE = 0,
+    OFFLINE = 1,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -60,6 +68,7 @@ struct Server {
     ip: String,
     uuid: Uuid,
     config: Option<Uuid>,
+    status: ServerStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -86,12 +95,13 @@ impl Config {
 
 // Struct representing a server
 impl Server {
-    fn new(name: String, ip: String) -> Server {
+    fn new(name: String, ip: String, uuid: Uuid) -> Server {
         Server {
             name,
             ip,
-            uuid: Uuid::new_v4(),
-            config: None
+            uuid,
+            config: None,
+            status: ServerStatus::ONLINE,
         }
     }
 }
@@ -113,6 +123,13 @@ impl Status {
 lazy_static! {
     static ref CONFIGS: Mutex<HashMap<Uuid, Config>> = Mutex::new(HashMap::new());
     static ref SERVERS: Mutex<HashMap<Uuid, Server>> = Mutex::new(HashMap::new());
+    static ref EXPIRIES: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+    static ref READY_CONFIGS: Mutex<Vec<Uuid>> = Mutex::new(Vec::new());
+    static ref READY_SERVERS: Mutex<Vec<Uuid>> = Mutex::new(Vec::new());
+}
+
+fn make_slice<'a>(vector: &'a Vec<Vec<u8>>) -> Vec<&'a[u8]> {
+    vector.iter().map(|x| x.as_ref() as &[u8]).collect::<Vec<&[u8]>>()
 }
 
 fn hello_world(_: &mut Request) -> IronResult<Response> {
@@ -175,7 +192,11 @@ fn upload_config(req: &mut Request) -> IronResult<Response> {
     match CONFIGS.lock() {
         Ok(mut guard) => {
             let config = Config::new(name.to_string(), body.to_string());
+            if let Ok(mut list_guard) = READY_CONFIGS.lock() {
+                list_guard.push(config.uuid);
+            }
             guard.insert(config.uuid, config);
+
         },
         Err(_) => panic!("Couldn't acquire lock")
     }
@@ -215,7 +236,7 @@ fn delete_config(req: &mut Request) -> IronResult<Response> {
 }
 
 // Handler returning a JSON object storing all known servers.
-fn get_servers(req: &mut Request) -> IronResult<Response> {
+fn get_servers(_: &mut Request) -> IronResult<Response> {
     match SERVERS.lock() {
         Ok(guard) => Ok(Response::with((status::Ok, serde_json::to_string_pretty(&guard.deref()).unwrap()))),
         Err(_) => panic!("Couldn't lock SERVERS")
@@ -262,57 +283,21 @@ fn start_web_server() {
     println!("Server started at port 3000");
 }
 
-// Handles new server connections by inserting the server into SERVERS.
-fn start_secretary() {
-    let context = zmq::Context::new();
-
-    let register = context.socket(zmq::REP).unwrap();
-    assert!(register.bind("tcp://*:6001").is_ok());
-
-    loop {
-        let init_bytes = register.recv_bytes(0).unwrap();
-        let init: depot::ServerInit = parse_from_bytes(&init_bytes).unwrap();
-
-        let server = Server::new(String::from(init.get_name()),
-                                 String::from(init.get_ip()));
-        let id = server.uuid;
-
-        if let Ok(mut guard) = SERVERS.lock() {
-            guard.insert(id, server);
-        }
-
-        let mut init_resp = depot::ServerInitResponse::new();
-        init_resp.set_server_uuid(id.to_string());
-        let init_resp_bytes = init_resp.write_to_bytes().unwrap();
-        register.send(&init_resp_bytes, 0).unwrap();
-    }
-}
-
 // Collects reports from servers.
 fn start_sink() {
     let context = zmq::Context::new();
-    let receiver = context.socket(zmq::PULL).unwrap();
-    assert!(receiver.bind("tcp://*:5558").is_ok());
+    let receiver = context.socket(zmq::SUB).unwrap();
+    assert!(receiver.connect("tcp://localhost:5558").is_ok());
+    assert!(receiver.set_subscribe("".as_bytes()).is_ok());
 
-    let _ = receiver.recv_string(0).unwrap();
-
-    let start_time = Instant::now();
-
-    for task_nbr in 0..100 {
+    loop {
         let report_bytes = receiver.recv_bytes(0).unwrap();
         let report: depot::ServerReport = parse_from_bytes(&report_bytes).unwrap();
 
         // TODO: Instead of just printing, actually process report.
-        println!("{}: {:?}", task_nbr, report);
+        println!("Received publication: {:?}", report);
         let _ = io::stdout().flush();
     }
-
-    println!("Total elapsed time: {:?} msec", Duration::from_std(start_time.elapsed())
-        .unwrap().num_milliseconds());
-
-    let control = context.socket(zmq::PUB).unwrap();
-    assert!(control.bind("tcp://*:5559").is_ok());
-    control.send_str("kill", 0).unwrap();
 }
 
 // Make a config with the input name and body
@@ -327,6 +312,83 @@ fn make_config(name: &'static str, body: &'static str) -> Uuid {
     id
 }
 
+// Function to purge expired workers
+fn purge_workers() {
+    if let Ok(expiry_guard) = EXPIRIES.lock() {
+        if let Ok(mut list_guard) = READY_SERVERS.lock() {
+            let now = std::time::Instant::now();
+
+            // Update statuses
+            for id in list_guard.iter() {
+                if *expiry_guard.get(id).unwrap() < now {
+                    if let Ok(mut server_guard) = SERVERS.lock() {
+                        let entry = server_guard.get_mut(id).unwrap();
+                        entry.status = ServerStatus::OFFLINE;
+                    } else {
+                        panic!("Couldn't lock SERVERS");
+                    }
+                }
+            }
+
+            // Purge from ready list
+            list_guard.retain(|id| *expiry_guard.get(id).unwrap() > now);
+        } else {
+            panic!("Couldn't lock READY_SERVERS");
+        }
+    } else {
+        panic!("Couldn't lock EXPIRIES");
+    }
+}
+
+// Function called to initialize a worker and send response.
+fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
+    if let Ok(mut guard) = SERVERS.lock() {
+        if !guard.contains_key(identity) {
+            assert!(init.is_some());
+            let init = init.unwrap();
+            // We don't know about this server, so naively add to collections
+            let server = Server::new(String::from(init.get_name()),
+                                     String::from(init.get_ip()),
+                                     identity.clone());
+            guard.insert(identity.clone(), server);
+
+            // Insert at the end of ready list
+            if let Ok(mut list_guard) = READY_SERVERS.lock() {
+                list_guard.push(identity.clone());
+            } else {
+                panic!("Couldn't lock READY_SERVERS");
+            }
+
+            // Create expiry time
+            if let Ok(mut expiry_guard) = EXPIRIES.lock() {
+                expiry_guard.insert(identity.clone(), std::time::Instant::now() +
+                    std::time::Duration::from_millis(HEARTBEAT_INTERVAL));
+            } else {
+                panic!("Couldn't lock EXPIRIES");
+            }
+        } else {
+            // Move this server to the end of the list.
+            if let Ok(mut list_guard) = READY_SERVERS.lock() {
+                list_guard.retain(|x| *x != *identity);
+                list_guard.push(identity.clone())
+            } else {
+                panic!("Couldn't lock READY_SERVERS");
+            }
+
+            // Refresh timer
+            if let Ok(mut expiry_guard) = EXPIRIES.lock() {
+                let entry = expiry_guard.get_mut(identity).unwrap();
+                *entry = std::time::Instant::now() +
+                    std::time::Duration::from_millis(HEARTBEAT_INTERVAL);
+            } else {
+                panic!("Couldn't lock EXPIRIES");
+            }
+        }
+    } else {
+        panic!("Couldn't lock SERVERS");
+    }
+}
+
 fn main() {
     thread::spawn(move || {
         start_web_server();
@@ -336,11 +398,10 @@ fn main() {
         start_sink();
     });
 
-    thread::spawn(move || {
-        start_secretary();
-    });
-
     let hello_config_id = make_config("Hello", "Hello, world");
+    if let Ok(mut guard) = READY_CONFIGS.lock() {
+        guard.push(hello_config_id);
+    }
 
     let print_string = match CONFIGS.lock() {
         Ok(guard) => match guard.get(&hello_config_id) {
@@ -353,25 +414,51 @@ fn main() {
 
     // ZMQ Stuff
     let context = zmq::Context::new();
-    let sender = context.socket(zmq::PUSH).unwrap();
-    assert!(sender.bind("tcp://*:5557").is_ok());
+    let dispatcher = context.socket(zmq::ROUTER).unwrap();
+    assert!(dispatcher.bind("tcp://*:5557").is_ok());
 
-    let sink = context.socket(zmq::PUSH).unwrap();
-    assert!(sink.connect("tcp://localhost:5558").is_ok());
+    loop {
+        let is_readable;
+        {
+            let mut items = [dispatcher.as_poll_item(zmq::POLLIN)];
+            let rc = zmq::poll(&mut items, HEARTBEAT_INTERVAL as i64).unwrap();
+            if rc == -1 {
+                break;
+            }
 
-    println!("Press Enter when the workers are ready: ");
-    let stdin = io::stdin();
-    stdin.lock().lines().next();
-    println!("Sending tasks to workers...");
+            is_readable = items[0].is_readable();
+        }
 
-    sink.send_str("0", 0).unwrap();
+        if is_readable {
+            let msg = dispatcher.recv_multipart(0).unwrap();
+            assert_eq!(msg.len(), 4);
+            let identity = Uuid::from_bytes(&msg[0]).unwrap();
+            println!("\tMessage received from worker {}", identity);
+            let type_part: depot::TypeSignifier = parse_from_bytes(&msg[2]).unwrap();
 
-    for i in 0..100 {
-        // TODO: Actually send configs
-        let string = format!("{}: {}", i, print_string);
-        sender.send_str(&string, 0).unwrap();
+            dispatcher.send_multipart(&make_slice(&msg), 0).unwrap();
+
+            // Message should be identity | | TypeSignifier | content
+
+            match type_part.get_field_type() {
+                depot::ServerMessageType::INIT => {
+                    let init: depot::ServerInit = parse_from_bytes(&msg[3]).unwrap();
+                    let identity = Uuid::from_bytes(&msg[0]).unwrap();
+                    worker_ready(&identity, Some(&init));
+                },
+                depot::ServerMessageType::REPORT => {
+                    println!("Got heartbeat from {:?}", msg[0]);
+                    worker_ready(&identity, None);
+                },
+                _ => {
+                    println!("Received unexpected message type {:?}", type_part.get_field_type());
+                    return;
+                }
+            }
+        }
+
+        // Purge dead servers
+        println!("Purging");
+        purge_workers();
     }
-    thread::sleep(std::time::Duration::from_secs(1));
-
-    println!("Done")
 }
