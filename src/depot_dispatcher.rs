@@ -24,9 +24,12 @@ use std::io::{self, Write};
 use std::ops::Deref;
 use std::time::Instant;
 use std::str;
+use std::collections::HashSet;
 
 use iron::prelude::*;
-use iron::status;
+use iron::modifiers::Redirect;
+use iron::{Iron, Handler, Request, Response, IronResult, Chain, Url, status};
+use iron::AfterMiddleware;
 
 use hyper::header::{ContentType};
 use hyper::mime::{Mime, TopLevel, SubLevel};
@@ -38,6 +41,7 @@ use params::{Params, Value};
 use uuid::Uuid;
 
 use protobuf::core::parse_from_bytes;
+use protobuf::{Message, ProtobufResult};
 
 mod proto {
     pub mod depot;
@@ -46,7 +50,44 @@ mod proto {
 use proto::depot;
 
 const HEARTBEAT_LIVENESS: u64 = 3;
-const HEARTBEAT_INTERVAL: u64 = 10000;
+const HEARTBEAT_INTERVAL: u64 = 1000;
+
+const DEFAULT_BODY_STRING: &str = "agent:
+    discount_factor: 0.98
+    buffer_size: 1000000
+    batch_size: 64
+    num_motion_planned: 64
+    num_demonstrations: 100
+    num_joints: 6
+    exploration_rate: 0.01
+    tau: 0.05
+    actor_learning_rate: 0.0001
+    critic_learning_rate: 0.001
+    use_random_goal: True
+    planning_group: manipulator
+    critic_hidden_layers:
+        - 300
+    actor_hidden_layers:
+        - 300
+
+experiment:
+    name: default
+    computer_name: unspecified
+    num_episodes: 5000
+    episode_length: 100
+    slack_webhook: https://hooks.slack.com/services/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
+    num_tests: 100
+    test_frequency: 50
+";
+
+struct CorsMiddleware;
+
+impl AfterMiddleware for CorsMiddleware {
+    fn after(&self, req: &mut Request, mut res: Response) -> IronResult<Response> {
+        res.headers.set(hyper::header::AccessControlAllowOrigin::Any);
+        Ok(res)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ServerStatus {
@@ -79,6 +120,21 @@ struct Status {
     rewards_link: Option<String>,
     test_rewards_link: Option<String>,
     test_successes_link: Option<String>,
+}
+
+// Struct describing the expiration conditions for a server
+struct Expiry {
+    instant: Instant,
+    liveness: u64,
+}
+
+impl Expiry {
+    fn new() -> Expiry {
+        Expiry {
+            instant: Instant::now() + std::time::Duration::from_millis(HEARTBEAT_INTERVAL),
+            liveness: HEARTBEAT_LIVENESS,
+        }
+    }
 }
 
 // Struct representing a config
@@ -123,7 +179,7 @@ impl Status {
 lazy_static! {
     static ref CONFIGS: Mutex<HashMap<Uuid, Config>> = Mutex::new(HashMap::new());
     static ref SERVERS: Mutex<HashMap<Uuid, Server>> = Mutex::new(HashMap::new());
-    static ref EXPIRIES: Mutex<HashMap<Uuid, Instant>> = Mutex::new(HashMap::new());
+    static ref EXPIRIES: Mutex<HashMap<Uuid, Expiry>> = Mutex::new(HashMap::new());
     static ref READY_CONFIGS: Mutex<Vec<Uuid>> = Mutex::new(Vec::new());
     static ref READY_SERVERS: Mutex<Vec<Uuid>> = Mutex::new(Vec::new());
 }
@@ -189,11 +245,12 @@ fn upload_config(req: &mut Request) -> IronResult<Response> {
         _ => return Ok(Response::with(status::NotFound))
     };
 
+    // TODO: Prevent deadlock
     match CONFIGS.lock() {
         Ok(mut guard) => {
             let config = Config::new(name.to_string(), body.to_string());
             if let Ok(mut list_guard) = READY_CONFIGS.lock() {
-                list_guard.push(config.uuid);
+                list_guard.insert(0, config.uuid);
             }
             guard.insert(config.uuid, config);
 
@@ -201,7 +258,9 @@ fn upload_config(req: &mut Request) -> IronResult<Response> {
         Err(_) => panic!("Couldn't acquire lock")
     }
 
-    Ok(Response::with(status::Ok))
+    let url = Url::parse("http://localhost:3000").unwrap();
+
+    Ok(Response::with((status::Found, Redirect(url.clone()))))
 }
 
 // Handler for deleting configs
@@ -279,24 +338,40 @@ fn start_web_server() {
     router.get("/servers", get_servers, "get_servers");
     router.get("/server/:server", get_server, "get_server");
 
-    Iron::new(router).http("localhost:3000").unwrap();
-    println!("Server started at port 3000");
+    let mut chain = Chain::new(router);
+    let cors_middleware = CorsMiddleware {};
+    chain.link_after(cors_middleware);
+
+    Iron::new(chain).http("localhost:4000").unwrap();
+    println!("Server started at port 4000");
 }
 
 // Collects reports from servers.
 fn start_sink() {
     let context = zmq::Context::new();
     let receiver = context.socket(zmq::SUB).unwrap();
-    assert!(receiver.connect("tcp://localhost:5558").is_ok());
+    assert!(receiver.bind("tcp://*:5558").is_ok());
     assert!(receiver.set_subscribe("".as_bytes()).is_ok());
 
     loop {
-        let report_bytes = receiver.recv_bytes(0).unwrap();
-        let report: depot::ServerReport = parse_from_bytes(&report_bytes).unwrap();
+        let msg = receiver.recv_multipart(0).unwrap();
+        println!("Sink received msg: {:?}", msg);
+        assert_eq!(msg.len(), 3);
+        let type_part: depot::TypeSignifier = parse_from_bytes(&msg[1]).unwrap();
 
-        // TODO: Instead of just printing, actually process report.
-        println!("Received publication: {:?}", report);
-        let _ = io::stdout().flush();
+        // Message should be identity | | TypeSignifier | content
+
+        match type_part.get_field_type() {
+            depot::ServerMessageType::REPORT => {
+                let report: depot::ServerReport = parse_from_bytes(&msg[2]).unwrap();
+                let identity = Uuid::from_str(report.get_server_uuid()).unwrap();
+                println!("Got report from worker {:?}", identity);
+                worker_ready(&identity, None);
+            },
+            _ => {
+                println!("Sink Received unexpected message type {:?}", type_part.get_field_type());
+            }
+        }
     }
 }
 
@@ -314,24 +389,36 @@ fn make_config(name: &'static str, body: &'static str) -> Uuid {
 
 // Function to purge expired workers
 fn purge_workers() {
-    if let Ok(expiry_guard) = EXPIRIES.lock() {
+    // TODO: Prevent deadlock
+    if let Ok(mut expiry_guard) = EXPIRIES.lock() {
         if let Ok(mut list_guard) = READY_SERVERS.lock() {
             let now = std::time::Instant::now();
 
             // Update statuses
             for id in list_guard.iter() {
-                if *expiry_guard.get(id).unwrap() < now {
-                    if let Ok(mut server_guard) = SERVERS.lock() {
-                        let entry = server_guard.get_mut(id).unwrap();
-                        entry.status = ServerStatus::OFFLINE;
+                let expiry: &mut Expiry = expiry_guard.get_mut(id).unwrap();
+                if expiry.instant < now {
+                    if expiry.liveness == 0 {
+                        println!("Discarding worker {}", id);
+                        if let Ok(mut server_guard) = SERVERS.lock() {
+                            let entry = server_guard.get_mut(id).unwrap();
+                            entry.status = ServerStatus::OFFLINE;
+                        } else {
+                            panic!("Couldn't lock SERVERS");
+                        }
                     } else {
-                        panic!("Couldn't lock SERVERS");
+                        println!("Reducing liveness of worker {}", id);
+                        expiry.liveness -= 1;
+                        expiry.instant = now + std::time::Duration::from_millis(HEARTBEAT_INTERVAL);
                     }
                 }
             }
 
             // Purge from ready list
-            list_guard.retain(|id| *expiry_guard.get(id).unwrap() > now);
+            list_guard.retain(|id| {
+                let expiry = expiry_guard.get(id).unwrap();
+                expiry.instant > now || expiry.liveness != 0
+            });
         } else {
             panic!("Couldn't lock READY_SERVERS");
         }
@@ -340,8 +427,79 @@ fn purge_workers() {
     }
 }
 
+fn send_configs(socket: &zmq::Socket) {
+    if let Ok(mut config_guard) = READY_CONFIGS.lock() {
+        if config_guard.len() == 0 {
+            println!("D: No configs to send");
+            return;
+        }
+
+        if let Ok(mut server_guard) = READY_SERVERS.lock() {
+            if config_guard.len() == 0 {
+                println!("D: No ready servers");
+                return;
+            }
+
+            if let Ok(cmap_guard) = CONFIGS.lock() {
+                if let Ok(smap_guard) = SERVERS.lock() {
+                    // Loop and send configs to ready servers
+                    loop {
+                        if let Some(config_uuid) = config_guard.pop() {
+                            if let Some(server_uuid) = server_guard.pop() {
+                                let mut config_msg: Vec<Vec<u8>> = vec!();
+                                let config: &Config = cmap_guard.get(&config_uuid).unwrap();
+                                let server: &Server = smap_guard.get(&server_uuid).unwrap();
+
+                                // TODO: Update server, config information
+
+                                // Set identity
+                                config_msg.push(server.uuid.as_bytes().to_vec());
+
+                                // Blank space
+                                config_msg.push("".as_bytes().to_vec());
+
+                                // Set message type
+                                let mut type_part = depot::TypeSignifier::new();
+                                type_part.set_field_type(depot::ServerMessageType::CONFIG);
+                                config_msg.push(type_part.write_to_bytes().unwrap());
+
+                                // Set config part
+                                let mut config_part = depot::ServerConfig::new();
+                                config_part.set_name(config.name.clone());
+                                config_part.set_body(config.body.clone());
+                                config_part.set_uuid(config.uuid.to_string());
+                                config_msg.push(config_part.write_to_bytes().unwrap());
+
+                                let config_slice: &[&[u8]] = &make_slice(&config_msg);
+                                socket.send_multipart(config_slice, 0);
+                            } else {
+                                println!("Out of ready servers");
+                                config_guard.push(config_uuid);
+                                break;
+                            }
+                        } else {
+                            println!("Out of configs");
+                            break;
+                        }
+                    }
+                    println!("Done sending configs");
+                } else {
+                    panic!("Couldn't lock SERVERS");
+                }
+            } else {
+                panic!("Couldn't lock CONFIGS");
+            }
+        } else {
+            panic!("Couldn't lock READY_SERVERS");
+        }
+    } else {
+        panic!("Couldn't lock READY_CONFIGS");
+    }
+}
+
 // Function called to initialize a worker and send response.
 fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
+    // TODO: Prevent deadlock
     if let Ok(mut guard) = SERVERS.lock() {
         if !guard.contains_key(identity) {
             assert!(init.is_some());
@@ -361,8 +519,8 @@ fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
 
             // Create expiry time
             if let Ok(mut expiry_guard) = EXPIRIES.lock() {
-                expiry_guard.insert(identity.clone(), std::time::Instant::now() +
-                    std::time::Duration::from_millis(HEARTBEAT_INTERVAL));
+                let new_expiry = Expiry::new();
+                expiry_guard.insert(identity.clone(), new_expiry);
             } else {
                 panic!("Couldn't lock EXPIRIES");
             }
@@ -377,9 +535,10 @@ fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
 
             // Refresh timer
             if let Ok(mut expiry_guard) = EXPIRIES.lock() {
-                let entry = expiry_guard.get_mut(identity).unwrap();
-                *entry = std::time::Instant::now() +
+                let entry: &mut Expiry = expiry_guard.get_mut(identity).unwrap();
+                entry.instant = std::time::Instant::now() +
                     std::time::Duration::from_millis(HEARTBEAT_INTERVAL);
+                entry.liveness = HEARTBEAT_LIVENESS;
             } else {
                 panic!("Couldn't lock EXPIRIES");
             }
@@ -398,7 +557,7 @@ fn main() {
         start_sink();
     });
 
-    let hello_config_id = make_config("Hello", "Hello, world");
+    let hello_config_id = make_config("Hello", DEFAULT_BODY_STRING);
     if let Ok(mut guard) = READY_CONFIGS.lock() {
         guard.push(hello_config_id);
     }
@@ -436,8 +595,6 @@ fn main() {
             println!("\tMessage received from worker {}", identity);
             let type_part: depot::TypeSignifier = parse_from_bytes(&msg[2]).unwrap();
 
-            dispatcher.send_multipart(&make_slice(&msg), 0).unwrap();
-
             // Message should be identity | | TypeSignifier | content
 
             match type_part.get_field_type() {
@@ -447,7 +604,7 @@ fn main() {
                     worker_ready(&identity, Some(&init));
                 },
                 depot::ServerMessageType::REPORT => {
-                    println!("Got heartbeat from {:?}", msg[0]);
+                    println!("Got report from {:?}", msg[0]);
                     worker_ready(&identity, None);
                 },
                 _ => {
@@ -460,5 +617,9 @@ fn main() {
         // Purge dead servers
         println!("Purging");
         purge_workers();
+
+        // Send config if available
+        println!("Sending configs");
+        send_configs(&dispatcher);
     }
 }

@@ -2,6 +2,7 @@ extern crate zmq;
 extern crate protobuf;
 extern crate hyper;
 extern crate uuid;
+extern crate yaml_rust;
 
 mod proto {
     pub mod depot;
@@ -18,6 +19,8 @@ use hyper::Client;
 use proto::depot;
 
 use uuid::Uuid;
+
+use yaml_rust::YamlLoader;
 
 const HEARTBEAT_LIVENESS: u64 = 3;
 const HEARTBEAT_INTERVAL: u64 = 1000;
@@ -37,7 +40,7 @@ fn main() {
 
     let statistics = context.socket(zmq::PUB).unwrap();
     statistics.set_identity(identity.as_bytes()).unwrap();
-    assert!(statistics.bind("tcp://*:5558").is_ok());
+    assert!(statistics.connect("tcp://localhost:5558").is_ok());
 
     println!("I: Starting worker {} ({:?})", identity, identity.as_bytes());
 
@@ -69,30 +72,69 @@ fn main() {
 
     // Receive and process configs
     loop {
-        // TODO: Actually handle sent configs and send reports
-        // TODO: Poll instead of blocking
-        let msg = receiver.recv_multipart(0).unwrap();
-        println!("D: received message {:?}", msg);
-        let type_part: depot::TypeSignifier = parse_from_bytes(&msg[1]).unwrap();
+        let is_readable;
+        {
+            let mut items = [receiver.as_poll_item(zmq::POLLIN)];
+            let rc = zmq::poll(&mut items, HEARTBEAT_INTERVAL as i64).unwrap();
+            if rc == -1 {
+                break;
+            }
 
-        if type_part.get_field_type() != depot::ServerMessageType::CONFIG {
-            println!("E: found unexpected message type {:?}", type_part.get_field_type());
-
-            let mut report_msg: Vec<Vec<u8>> = vec!();
-            report_msg.push("".as_bytes().to_vec());
-            let mut type_part = depot::TypeSignifier::new();
-            type_part.set_field_type(depot::ServerMessageType::REPORT);
-            report_msg.push(type_part.write_to_bytes().unwrap());
-            report_msg.push("".as_bytes().to_vec());
-            let report_slice: &[&[u8]] = &make_slice(&report_msg);
-            receiver.send_multipart(report_slice, 0).unwrap();
-
-            return;
+            is_readable = items[0].is_readable();
         }
 
-        let string = str::from_utf8(&msg[2]).unwrap();
-        println!("{}.", string);
-        let _ = io::stdout().flush();
-        statistics.send_str("", 0).unwrap();
+        if is_readable {
+            let msg = receiver.recv_multipart(0).unwrap();
+            println!("D: received message {:?}", msg);
+            let type_part: depot::TypeSignifier = parse_from_bytes(&msg[1]).unwrap();
+
+            if type_part.get_field_type() != depot::ServerMessageType::CONFIG {
+                println!("E: found unexpected message type {:?}", type_part.get_field_type());
+
+                let mut report_msg: Vec<Vec<u8>> = vec!();
+                report_msg.push("".as_bytes().to_vec());
+                let mut type_part = depot::TypeSignifier::new();
+                type_part.set_field_type(depot::ServerMessageType::REPORT);
+                report_msg.push(type_part.write_to_bytes().unwrap());
+                report_msg.push("".as_bytes().to_vec());
+                let report_slice: &[&[u8]] = &make_slice(&report_msg);
+                statistics.send_multipart(report_slice, 0).unwrap();
+
+                return;
+            }
+
+            // TODO: Actually handle sent configs and send reports
+            // TODO: Poll instead of blocking
+            let config_msg: depot::ServerConfig = parse_from_bytes(&msg[2]).unwrap();
+            println!("D: Got config message with name {}", config_msg.get_name());
+            let configs_maybe = YamlLoader::load_from_str(config_msg.get_body());
+            if let Ok(configs) = configs_maybe {
+                let config = &configs[0];
+                println!("D: Parsed YAML config body: {:?}", config);
+
+                if let Some(num_episodes) = config["experiment"]["num_episodes"].as_i64() {
+                    let ep_length = config["experiment"]["episode_length"].as_i64().unwrap();
+                    println!("Got config with {} episodes of length {}", num_episodes, ep_length);
+                } else {
+                    println!("E: Config body did not contain expected fields");
+                    // TODO: Re-send init or something to signal readiness, instead of using worker_ready on heartbeats
+                }
+            } else {
+                println!("E: Received message with non-YAML config body");
+            }
+        }
+
+        let mut report_msg: Vec<Vec<u8>> = vec!();
+        report_msg.push("".as_bytes().to_vec());
+        let mut type_part = depot::TypeSignifier::new();
+        type_part.set_field_type(depot::ServerMessageType::REPORT);
+        report_msg.push(type_part.write_to_bytes().unwrap());
+
+        // Make report
+        let mut report_part = depot::ServerReport::new();
+        report_part.set_server_uuid(identity.to_string());
+        report_msg.push(report_part.write_to_bytes().unwrap());
+        let report_slice: &[&[u8]] = &make_slice(&report_msg);
+        statistics.send_multipart(report_slice, 0).unwrap();
     }
 }
