@@ -365,8 +365,39 @@ fn start_sink() {
             depot::ServerMessageType::REPORT => {
                 let report: depot::ServerReport = parse_from_bytes(&msg[2]).unwrap();
                 let identity = Uuid::from_str(report.get_server_uuid()).unwrap();
-                println!("Got report from worker {:?}", identity);
-                worker_ready(&identity, None);
+                println!("D: Got report from worker {:?}", identity);
+                worker_live(&identity);
+                println!("D: Worker {:?} is on ep_num {}", identity, report.get_ep_num());
+                if report.get_has_config() {
+                    let config_uuid = Uuid::from_str(report.get_config_uuid()).unwrap();
+                    println!("D: Worker {:?} has config {:?}", identity, config_uuid);
+
+                    // Update server
+                    if let Ok(mut servers_guard) = SERVERS.lock() {
+                        if let Some(server) = servers_guard.get_mut(&identity) {
+                            server.config = Some(config_uuid);
+                        }
+                    }
+
+                    // Update config
+                    if let Ok(mut configs_guard) = CONFIGS.lock() {
+                        if let Some(server_config) = configs_guard.get_mut(&config_uuid) {
+                            let mut status: &mut Status = &mut server_config.status;
+                            status.server = Some(identity.clone());
+                            status.ep_num = report.get_ep_num();
+                            status.done = report.get_done();
+                        }
+                    }
+                } else {
+                    println!("D: Worker {:?} has no config", identity);
+
+                    // Update server
+                    if let Ok(mut servers_guard) = SERVERS.lock() {
+                        if let Some(server) = servers_guard.get_mut(&identity) {
+                            server.config = None;
+                        }
+                    }
+                }
             },
             _ => {
                 println!("Sink Received unexpected message type {:?}", type_part.get_field_type());
@@ -497,6 +528,27 @@ fn send_configs(socket: &zmq::Socket) {
     }
 }
 
+// Function called to refresh liveness of a worker.
+fn worker_live(identity: &Uuid) {
+    // Move this server to the end of the list.
+    if let Ok(mut list_guard) = READY_SERVERS.lock() {
+        list_guard.retain(|x| *x != *identity);
+        list_guard.push(identity.clone())
+    } else {
+        panic!("Couldn't lock READY_SERVERS");
+    }
+
+    // Refresh timer
+    if let Ok(mut expiry_guard) = EXPIRIES.lock() {
+        let entry: &mut Expiry = expiry_guard.get_mut(identity).unwrap();
+        entry.instant = std::time::Instant::now() +
+            std::time::Duration::from_millis(HEARTBEAT_INTERVAL);
+        entry.liveness = HEARTBEAT_LIVENESS;
+    } else {
+        panic!("Couldn't lock EXPIRIES");
+    }
+}
+
 // Function called to initialize a worker and send response.
 fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
     // TODO: Prevent deadlock
@@ -525,23 +577,7 @@ fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
                 panic!("Couldn't lock EXPIRIES");
             }
         } else {
-            // Move this server to the end of the list.
-            if let Ok(mut list_guard) = READY_SERVERS.lock() {
-                list_guard.retain(|x| *x != *identity);
-                list_guard.push(identity.clone())
-            } else {
-                panic!("Couldn't lock READY_SERVERS");
-            }
-
-            // Refresh timer
-            if let Ok(mut expiry_guard) = EXPIRIES.lock() {
-                let entry: &mut Expiry = expiry_guard.get_mut(identity).unwrap();
-                entry.instant = std::time::Instant::now() +
-                    std::time::Duration::from_millis(HEARTBEAT_INTERVAL);
-                entry.liveness = HEARTBEAT_LIVENESS;
-            } else {
-                panic!("Couldn't lock EXPIRIES");
-            }
+            worker_live(identity);
         }
     } else {
         panic!("Couldn't lock SERVERS");
