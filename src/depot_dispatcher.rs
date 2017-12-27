@@ -20,15 +20,13 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use std::thread;
-use std::io::{self, Write};
 use std::ops::Deref;
 use std::time::Instant;
 use std::str;
-use std::collections::HashSet;
 
 use iron::prelude::*;
 use iron::modifiers::Redirect;
-use iron::{Iron, Handler, Request, Response, IronResult, Chain, Url, status};
+use iron::{Iron, Request, Response, IronResult, Chain, Url, status};
 use iron::AfterMiddleware;
 
 use hyper::header::{ContentType};
@@ -41,7 +39,7 @@ use params::{Params, Value};
 use uuid::Uuid;
 
 use protobuf::core::parse_from_bytes;
-use protobuf::{Message, ProtobufResult};
+use protobuf::Message;
 
 mod proto {
     pub mod depot;
@@ -83,7 +81,7 @@ experiment:
 struct CorsMiddleware;
 
 impl AfterMiddleware for CorsMiddleware {
-    fn after(&self, req: &mut Request, mut res: Response) -> IronResult<Response> {
+    fn after(&self, _: &mut Request, mut res: Response) -> IronResult<Response> {
         res.headers.set(hyper::header::AccessControlAllowOrigin::Any);
         Ok(res)
     }
@@ -198,9 +196,11 @@ fn hello_world(_: &mut Request) -> IronResult<Response> {
 
 // Handler for listing all configs
 fn get_configs(_: &mut Request) -> IronResult<Response> {
-    match CONFIGS.lock() {
-        Ok(guard) => Ok(Response::with((status::Ok, serde_json::to_string_pretty(&guard.deref()).unwrap()))),
-        Err(_) => panic!("Couldn't lock CONFIGS")
+    loop {
+        let lock = CONFIGS.try_lock();
+        if let Ok(guard) = lock {
+            return Ok(Response::with((status::Ok, serde_json::to_string_pretty(&guard.deref()).unwrap())))
+        }
     }
 }
 
@@ -214,15 +214,16 @@ fn get_config(req: &mut Request) -> IronResult<Response> {
         None => return Ok(Response::with(status::NotFound))
     };
 
-    match CONFIGS.lock() {
-        Ok(guard) => {
+    loop {
+        let lock = CONFIGS.try_lock();
+        if let Ok(guard) = lock {
             let config = match guard.get(config_id) {
                 Some(val) => val,
                 None => return Ok(Response::with(status::NotFound))
             };
-            Ok(Response::with((status::Ok, serde_json::to_string_pretty(config).unwrap())))
-        },
-        Err(_) => panic!("Couldn't lock CONFIGS")
+
+            return Ok(Response::with((status::Ok, serde_json::to_string_pretty(config).unwrap())))
+        }
     }
 }
 
@@ -245,22 +246,25 @@ fn upload_config(req: &mut Request) -> IronResult<Response> {
         _ => return Ok(Response::with(status::NotFound))
     };
 
-    // TODO: Prevent deadlock
-    match CONFIGS.lock() {
-        Ok(mut guard) => {
-            let config = Config::new(name.to_string(), body.to_string());
-            if let Ok(mut list_guard) = READY_CONFIGS.lock() {
-                list_guard.insert(0, config.uuid);
+    // Prevent deadlock using try_lock
+    loop {
+        let lock = CONFIGS.try_lock();
+        if let Ok(mut guard) = lock {
+            loop {
+                let list_lock = READY_CONFIGS.try_lock();
+                if let Ok(mut list_guard) = list_lock {
+                    let config = Config::new(name.to_string(), body.to_string());
+                    list_guard.insert(0, config.uuid);
+                    guard.insert(config.uuid, config);
+
+                    let url = Url::parse("http://localhost:3000").unwrap();
+                    return Ok(Response::with((status::Found, Redirect(url.clone()))));
+                } else {
+                    break;
+                }
             }
-            guard.insert(config.uuid, config);
-
-        },
-        Err(_) => panic!("Couldn't acquire lock")
+        }
     }
-
-    let url = Url::parse("http://localhost:3000").unwrap();
-
-    Ok(Response::with((status::Found, Redirect(url.clone()))))
 }
 
 // Handler for deleting configs
@@ -282,15 +286,15 @@ fn delete_config(req: &mut Request) -> IronResult<Response> {
         _ => return Ok(Response::with(status::NotFound))
     };
 
-    match CONFIGS.lock() {
-        Ok(mut guard) => {
+    loop {
+        let lock = CONFIGS.try_lock();
+        if let Ok(mut guard) = lock {
             let config = guard.remove(&config_id);
             match config {
-                Some(_) => Ok(Response::with(status::Ok)),
-                None => Ok(Response::with(status::NotFound))
+                Some(_) => return Ok(Response::with(status::Ok)),
+                None => return Ok(Response::with(status::NotFound))
             }
-        },
-        Err(_) => panic!("Couldn't acquire lock")
+        }
     }
 }
 
@@ -355,7 +359,7 @@ fn start_sink() {
 
     loop {
         let msg = receiver.recv_multipart(0).unwrap();
-        println!("Sink received msg: {:?}", msg);
+        println!("D: Sink received msg: {:?}", msg);
         assert_eq!(msg.len(), 3);
         let type_part: depot::TypeSignifier = parse_from_bytes(&msg[1]).unwrap();
 
@@ -365,10 +369,14 @@ fn start_sink() {
             depot::ServerMessageType::REPORT => {
                 let report: depot::ServerReport = parse_from_bytes(&msg[2]).unwrap();
                 let identity = Uuid::from_str(report.get_server_uuid()).unwrap();
+
                 println!("D: Got report from worker {:?}", identity);
-                worker_live(&identity);
                 println!("D: Worker {:?} is on ep_num {}", identity, report.get_ep_num());
+
                 if report.get_has_config() {
+                    // Refresh timer, but don't add to ready list
+                    worker_live(&identity, false);
+
                     let config_uuid = Uuid::from_str(report.get_config_uuid()).unwrap();
                     println!("D: Worker {:?} has config {:?}", identity, config_uuid);
 
@@ -382,7 +390,7 @@ fn start_sink() {
                     // Update config
                     if let Ok(mut configs_guard) = CONFIGS.lock() {
                         if let Some(server_config) = configs_guard.get_mut(&config_uuid) {
-                            let mut status: &mut Status = &mut server_config.status;
+                            let status: &mut Status = &mut server_config.status;
                             status.server = Some(identity.clone());
                             status.ep_num = report.get_ep_num();
                             status.done = report.get_done();
@@ -390,6 +398,9 @@ fn start_sink() {
                     }
                 } else {
                     println!("D: Worker {:?} has no config", identity);
+
+                    // Refresh timer and add to ready list
+                    worker_live(&identity, true);
 
                     // Update server
                     if let Ok(mut servers_guard) = SERVERS.lock() {
@@ -400,7 +411,7 @@ fn start_sink() {
                 }
             },
             _ => {
-                println!("Sink Received unexpected message type {:?}", type_part.get_field_type());
+                println!("D: Sink Received unexpected message type {:?}", type_part.get_field_type());
             }
         }
     }
@@ -420,7 +431,7 @@ fn make_config(name: &'static str, body: &'static str) -> Uuid {
 
 // Function to purge expired workers
 fn purge_workers() {
-    // TODO: Prevent deadlock
+    // Deadlock prevented in other threads, not considered in main
     if let Ok(mut expiry_guard) = EXPIRIES.lock() {
         if let Ok(mut list_guard) = READY_SERVERS.lock() {
             let now = std::time::Instant::now();
@@ -430,15 +441,33 @@ fn purge_workers() {
                 let expiry: &mut Expiry = expiry_guard.get_mut(id).unwrap();
                 if expiry.instant < now {
                     if expiry.liveness == 0 {
-                        println!("Discarding worker {}", id);
+                        println!("D: Discarding worker {}", id);
                         if let Ok(mut server_guard) = SERVERS.lock() {
-                            let entry = server_guard.get_mut(id).unwrap();
+                            let entry: &mut Server = server_guard.get_mut(id).unwrap();
                             entry.status = ServerStatus::OFFLINE;
+
+                            if let Some(config_uuid) = entry.config {
+                                if let Ok(mut config_guard) = CONFIGS.lock() {
+                                    if let Some(config) = config_guard.get_mut(&config_uuid) {
+                                        // If server doing config went down and config was not done, reclaim
+                                        if !config.status.done {
+                                            // Reset config status
+                                            config.status = Status::new();
+                                            if let Ok(mut config_list_guard) = READY_CONFIGS.lock() {
+                                                config_list_guard.push(config.uuid.clone())
+                                            }
+                                            println!("D: Reclaimed config {:?}", config.uuid);
+                                        }
+                                    }
+                                } else {
+                                    panic!("Couldn't lock CONFIGS");
+                                }
+                            }
                         } else {
                             panic!("Couldn't lock SERVERS");
                         }
                     } else {
-                        println!("Reducing liveness of worker {}", id);
+                        println!("I: Reducing liveness of worker {}", id);
                         expiry.liveness -= 1;
                         expiry.instant = now + std::time::Duration::from_millis(HEARTBEAT_INTERVAL);
                     }
@@ -478,42 +507,46 @@ fn send_configs(socket: &zmq::Socket) {
                         if let Some(config_uuid) = config_guard.pop() {
                             if let Some(server_uuid) = server_guard.pop() {
                                 let mut config_msg: Vec<Vec<u8>> = vec!();
-                                let config: &Config = cmap_guard.get(&config_uuid).unwrap();
-                                let server: &Server = smap_guard.get(&server_uuid).unwrap();
+                                if let Some(config) = cmap_guard.get(&config_uuid) {
+                                    let server: &Server = smap_guard.get(&server_uuid).unwrap();
 
-                                // TODO: Update server, config information
+                                    // TODO: Update server, config information
 
-                                // Set identity
-                                config_msg.push(server.uuid.as_bytes().to_vec());
+                                    // Set identity
+                                    config_msg.push(server.uuid.as_bytes().to_vec());
 
-                                // Blank space
-                                config_msg.push("".as_bytes().to_vec());
+                                    // Blank space
+                                    config_msg.push("".as_bytes().to_vec());
 
-                                // Set message type
-                                let mut type_part = depot::TypeSignifier::new();
-                                type_part.set_field_type(depot::ServerMessageType::CONFIG);
-                                config_msg.push(type_part.write_to_bytes().unwrap());
+                                    // Set message type
+                                    let mut type_part = depot::TypeSignifier::new();
+                                    type_part.set_field_type(depot::ServerMessageType::CONFIG);
+                                    config_msg.push(type_part.write_to_bytes().unwrap());
 
-                                // Set config part
-                                let mut config_part = depot::ServerConfig::new();
-                                config_part.set_name(config.name.clone());
-                                config_part.set_body(config.body.clone());
-                                config_part.set_uuid(config.uuid.to_string());
-                                config_msg.push(config_part.write_to_bytes().unwrap());
+                                    // Set config part
+                                    let mut config_part = depot::ServerConfig::new();
+                                    config_part.set_name(config.name.clone());
+                                    config_part.set_body(config.body.clone());
+                                    config_part.set_uuid(config.uuid.to_string());
+                                    config_msg.push(config_part.write_to_bytes().unwrap());
 
-                                let config_slice: &[&[u8]] = &make_slice(&config_msg);
-                                socket.send_multipart(config_slice, 0);
+                                    let config_slice: &[&[u8]] = &make_slice(&config_msg);
+                                    socket.send_multipart(config_slice, 0).unwrap();
+                                } else {
+                                    println!("Found config in ready list which has been deleted, skipping");
+                                    continue;
+                                }
                             } else {
-                                println!("Out of ready servers");
+                                println!("D: Out of ready servers");
                                 config_guard.push(config_uuid);
                                 break;
                             }
                         } else {
-                            println!("Out of configs");
+                            println!("D: Out of configs");
                             break;
                         }
                     }
-                    println!("Done sending configs");
+                    println!("D: Done sending configs");
                 } else {
                     panic!("Couldn't lock SERVERS");
                 }
@@ -529,11 +562,13 @@ fn send_configs(socket: &zmq::Socket) {
 }
 
 // Function called to refresh liveness of a worker.
-fn worker_live(identity: &Uuid) {
+fn worker_live(identity: &Uuid, add: bool) {
     // Move this server to the end of the list.
     if let Ok(mut list_guard) = READY_SERVERS.lock() {
         list_guard.retain(|x| *x != *identity);
-        list_guard.push(identity.clone())
+        if add {
+            list_guard.push(identity.clone());
+        }
     } else {
         panic!("Couldn't lock READY_SERVERS");
     }
@@ -551,7 +586,7 @@ fn worker_live(identity: &Uuid) {
 
 // Function called to initialize a worker and send response.
 fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
-    // TODO: Prevent deadlock
+    // Deadlock prevented in other threads, this function should only be called from main
     if let Ok(mut guard) = SERVERS.lock() {
         if !guard.contains_key(identity) {
             assert!(init.is_some());
@@ -577,7 +612,7 @@ fn worker_ready(identity: &Uuid, init: Option<&depot::ServerInit>) {
                 panic!("Couldn't lock EXPIRIES");
             }
         } else {
-            worker_live(identity);
+            worker_live(identity, true);
         }
     } else {
         panic!("Couldn't lock SERVERS");
@@ -628,7 +663,7 @@ fn main() {
             let msg = dispatcher.recv_multipart(0).unwrap();
             assert_eq!(msg.len(), 4);
             let identity = Uuid::from_bytes(&msg[0]).unwrap();
-            println!("\tMessage received from worker {}", identity);
+            println!("D: Message received from worker {}", identity);
             let type_part: depot::TypeSignifier = parse_from_bytes(&msg[2]).unwrap();
 
             // Message should be identity | | TypeSignifier | content
@@ -640,22 +675,22 @@ fn main() {
                     worker_ready(&identity, Some(&init));
                 },
                 depot::ServerMessageType::REPORT => {
-                    println!("Got report from {:?}", msg[0]);
+                    println!("D: Got report from {:?}", msg[0]);
                     worker_ready(&identity, None);
                 },
                 _ => {
-                    println!("Received unexpected message type {:?}", type_part.get_field_type());
+                    println!("W: Received unexpected message type {:?}", type_part.get_field_type());
                     return;
                 }
             }
         }
 
         // Purge dead servers
-        println!("Purging");
+        println!("D: Purging");
         purge_workers();
 
         // Send config if available
-        println!("Sending configs");
+        println!("D: Sending configs");
         send_configs(&dispatcher);
     }
 }

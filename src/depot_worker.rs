@@ -48,6 +48,46 @@ fn do_work(num_eps: u32) {
     }
 }
 
+fn send_report(socket: &zmq::Socket, identity: &Uuid) {
+    let mut report_msg: Vec<Vec<u8>> = vec!();
+    report_msg.push("".as_bytes().to_vec());
+    let mut type_part = depot::TypeSignifier::new();
+    type_part.set_field_type(depot::ServerMessageType::REPORT);
+    report_msg.push(type_part.write_to_bytes().unwrap());
+
+    // Make report
+    let mut report_part = depot::ServerReport::new();
+    let mut config_done = false;
+    report_part.set_server_uuid(identity.to_string());
+    report_part.set_ep_num(*CURRENT_EP_NUM.lock().expect("E: Couldn't lock ep_num"));
+    if let Ok(mut current_config) = CURRENT_CONFIG.lock() {
+        match *current_config {
+            Some(ref config) => {
+                report_part.set_has_config(true);
+                report_part.set_config_uuid(config.get_uuid().to_string());
+                if *CURRENT_MAX_EP_NUM.lock().unwrap() - 1 == *CURRENT_EP_NUM.lock().unwrap() {
+                    report_part.set_done(true);
+                    config_done = true;
+                } else {
+                    report_part.set_done(false);
+                }
+            },
+            None => report_part.set_has_config(false),
+        }
+    } else {
+        panic!("Couldn't lock current config");
+    }
+
+    if config_done {
+        *CURRENT_CONFIG.lock().unwrap() = None;
+        *CURRENT_EP_NUM.lock().unwrap() = 0;
+    }
+
+    report_msg.push(report_part.write_to_bytes().unwrap());
+    let report_slice: &[&[u8]] = &make_slice(&report_msg);
+    socket.send_multipart(report_slice, 0).unwrap();
+}
+
 fn main() {
     let context = zmq::Context::new();
     let identity = Uuid::new_v4();
@@ -122,8 +162,6 @@ fn main() {
                 return;
             }
 
-            // TODO: Actually handle sent configs and send reports
-            // TODO: Poll instead of blocking
             let config_msg: depot::ServerConfig = parse_from_bytes(&msg[2]).unwrap();
             if let Ok(mut current_config) = CURRENT_CONFIG.lock() {
                 if current_config.is_none() {
@@ -157,42 +195,6 @@ fn main() {
             }
         }
 
-        let mut report_msg: Vec<Vec<u8>> = vec!();
-        report_msg.push("".as_bytes().to_vec());
-        let mut type_part = depot::TypeSignifier::new();
-        type_part.set_field_type(depot::ServerMessageType::REPORT);
-        report_msg.push(type_part.write_to_bytes().unwrap());
-
-        // Make report
-        let mut report_part = depot::ServerReport::new();
-        let mut config_done = false;
-        report_part.set_server_uuid(identity.to_string());
-        report_part.set_ep_num(*CURRENT_EP_NUM.lock().expect("E: Couldn't lock ep_num"));
-        if let Ok(mut current_config) = CURRENT_CONFIG.lock() {
-            match *current_config {
-                Some(ref config) => {
-                    report_part.set_has_config(true);
-                    report_part.set_config_uuid(config.get_uuid().to_string());
-                    if *CURRENT_MAX_EP_NUM.lock().unwrap() - 1 == *CURRENT_EP_NUM.lock().unwrap() {
-                        report_part.set_done(true);
-                        config_done = true;
-                    } else {
-                        report_part.set_done(false);
-                    }
-                },
-                None => report_part.set_has_config(false),
-            }
-        } else {
-            panic!("Couldn't lock current config");
-        }
-
-        if config_done {
-            *CURRENT_CONFIG.lock().unwrap() = None;
-            *CURRENT_EP_NUM.lock().unwrap() = 0;
-        }
-
-        report_msg.push(report_part.write_to_bytes().unwrap());
-        let report_slice: &[&[u8]] = &make_slice(&report_msg);
-        statistics.send_multipart(report_slice, 0).unwrap();
+        send_report(&statistics, &identity);
     }
 }
