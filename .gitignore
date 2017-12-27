@@ -14,3 +14,9 @@ Cargo.lock
 **.iml
 
 src/proto
+
+**.mov
+**.mp4
+**.DS_Store
+
+**.swp
