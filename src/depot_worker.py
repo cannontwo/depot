@@ -3,7 +3,7 @@
 import time
 import zmq
 import uuid
-import threading
+from threading import Thread, Lock
 from urllib.request import urlopen
 
 import depot_pb2 as depot
@@ -14,14 +14,6 @@ HEARTBEAT_INTERVAL = 1000
 CURRENT_EP_NUM = 0
 CURRENT_MAX_EP_NUM = 0
 CURRENT_CONFIG = None
-
-class WorkerThread(threading.Thread):
-    def __init__(self, num_eps):
-        threading.Thread.__init__(self)
-        self.num_eps = num_eps
-
-    def run(self):
-        do_work(self.num_eps)
 
 
 # Spin to simulate work
@@ -141,8 +133,9 @@ def main():
             print("D: Got config message with name {}".format(config_msg.name))
 
             # TODO: Parse config as yaml
-            new_thread = WorkerThread(5000)
-            new_thread.start()
+            t = Thread(target=do_work, args=(5000,))
+            t.start()
+            
 
         send_report(statistics, identity)
 
