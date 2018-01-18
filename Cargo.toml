@@ -15,7 +15,7 @@ serde_derive = "*"
 yaml-rust = "0.3"
 params = "*"
 protobuf = "*"
-hyper = "*"
+hyper = "0.10"
 
 [dependencies.uuid]
 version = "*"

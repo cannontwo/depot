@@ -1,4 +1,4 @@
-syntax = "proto3";
+syntax = "proto2";
 
 package depot;
 
@@ -11,29 +11,28 @@ enum ServerMessageType {
 
 // Message representing the type of the top-level message
 message TypeSignifier {
-    ServerMessageType type = 1;
+    required ServerMessageType type = 1;
 }
 
 // Message sent by worker sever to register with depot config dispatcher.
 message ServerInit {
-    string name = 1;
-    string ip = 2;
+    required string name = 1;
+    required string ip = 2;
 }
 
 // Message sent by depot config dispatcher to server with new config to process.
 message ServerConfig {
-    string uuid = 1;
-    string name = 2;
-    string body = 3;
+    required string uuid = 1;
+    required string name = 2;
+    required string body = 3;
 }
 
 // Message sent by worker server to depot dispatcher as heartbeat.
 message ServerReport {
-    string server_uuid = 1;
-    string timestamp = 2; // Should be some standard timestamp format
-    uint32 ep_num = 3;
+    required string server_uuid = 1;
+    required uint32 ep_num = 3;
 
-    bool has_config = 4;
-    bool done = 5;
-    string config_uuid = 6;
+    required bool has_config = 4;
+    optional bool done = 5;
+    optional string config_uuid = 6;
 }
