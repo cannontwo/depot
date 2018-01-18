@@ -3,7 +3,8 @@
 import time
 import zmq
 import uuid
-from urllib2 import urlopen
+import threading
+from urllib.request import urlopen
 
 import depot_pb2 as depot
 
@@ -14,10 +15,20 @@ CURRENT_EP_NUM = 0
 CURRENT_MAX_EP_NUM = 0
 CURRENT_CONFIG = None
 
+class WorkerThread(threading.Thread):
+    def __init__(self, num_eps):
+        threading.Thread.__init__(self)
+        self.num_eps = num_eps
+
+    def run(self):
+        do_work(self.num_eps)
+
 
 # Spin to simulate work
 # TODO: Replace with robot code
 def do_work(num_eps):
+    global CURRENT_EP_NUM
+
     for i in range(num_eps):
         print("Doing work episode {}".format(i))
         CURRENT_EP_NUM = i
@@ -27,6 +38,7 @@ def do_work(num_eps):
 def send_report(socket, identity):
     global CURRENT_EP_NUM
     global CURRENT_CONFIG
+    global CURRENT_MAX_EP_NUM
 
     report_msg = []
     report_msg.append("".encode())
@@ -97,7 +109,6 @@ def main():
 
     while True:
         socks = dict(poller.poll(HEARTBEAT_INTERVAL))
-        print socks
 
         if socks.get(receiver) == zmq.POLLIN:
             msg = receiver.recv_multipart()
@@ -130,6 +141,8 @@ def main():
             print("D: Got config message with name {}".format(config_msg.name))
 
             # TODO: Parse config as yaml
+            new_thread = WorkerThread(5000)
+            new_thread.start()
 
         send_report(statistics, identity)
 
