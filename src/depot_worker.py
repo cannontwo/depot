@@ -3,6 +3,7 @@
 import time
 import zmq
 import uuid
+import yaml
 from urllib2 import urlopen
 
 import depot_pb2 as depot
@@ -59,6 +60,8 @@ def send_report(socket, identity):
 
 def main():
     global CURRENT_CONFIG
+    global CURRENT_EP_NUM
+    global CURRENT_MAX_EP_NUM
 
     context = zmq.Context()
     identity = uuid.uuid4()
@@ -129,7 +132,25 @@ def main():
 
             print("D: Got config message with name {}".format(config_msg.name))
 
-            # TODO: Parse config as yaml
+            try:
+                configs = yaml.load(config_msg.body)
+                config = configs[0]
+                print("D: Parsed YAML config body: {}".format(config))
+
+                if config.has_key("experiment"):
+                    if config.has_key("num_episodes"):
+                        num_eps = config["experiment"]["num_episodes"]
+                        print("D: Got config with {} episodes", num_eps)
+                        CURRENT_MAX_EP_NUM = num_eps
+
+                        # TODO: Run thread
+                    else:
+                        print("E: Config didn't contain expected fields")
+                else:
+                    print("E: Config didn't contain expected fields")
+
+            except yaml.YAMLError, exc:
+                print("E: Received message with non-YAML config body")
 
         send_report(statistics, identity)
 
