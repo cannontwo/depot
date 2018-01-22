@@ -4,7 +4,8 @@ import time
 import zmq
 import uuid
 import yaml
-from urllib2 import urlopen
+from threading import Thread, Lock
+from urllib.request import urlopen
 
 import depot_pb2 as depot
 
@@ -19,6 +20,8 @@ CURRENT_CONFIG = None
 # Spin to simulate work
 # TODO: Replace with robot code
 def do_work(num_eps):
+    global CURRENT_EP_NUM
+
     for i in range(num_eps):
         print("Doing work episode {}".format(i))
         CURRENT_EP_NUM = i
@@ -28,6 +31,7 @@ def do_work(num_eps):
 def send_report(socket, identity):
     global CURRENT_EP_NUM
     global CURRENT_CONFIG
+    global CURRENT_MAX_EP_NUM
 
     report_msg = []
     report_msg.append("".encode())
@@ -100,7 +104,6 @@ def main():
 
     while True:
         socks = dict(poller.poll(HEARTBEAT_INTERVAL))
-        print socks
 
         if socks.get(receiver) == zmq.POLLIN:
             msg = receiver.recv_multipart()
@@ -142,14 +145,14 @@ def main():
                         num_eps = config["experiment"]["num_episodes"]
                         print("D: Got config with {} episodes", num_eps)
                         CURRENT_MAX_EP_NUM = num_eps
-
-                        # TODO: Run thread
+                        t = Thread(target=do_work, args=(num_eps,))
+                        t.start()
                     else:
                         print("E: Config didn't contain expected fields")
                 else:
                     print("E: Config didn't contain expected fields")
 
-            except yaml.YAMLError, exc:
+            except yaml.YAMLError:
                 print("E: Received message with non-YAML config body")
 
         send_report(statistics, identity)

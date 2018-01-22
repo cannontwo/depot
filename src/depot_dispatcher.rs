@@ -510,7 +510,7 @@ fn send_configs(socket: &zmq::Socket) {
                                 if let Some(config) = cmap_guard.get(&config_uuid) {
                                     let server: &Server = smap_guard.get(&server_uuid).unwrap();
 
-                                    // TODO: Update server, config information
+                                    // TODO: Update server, config information and test in sink
 
                                     // Set identity
                                     config_msg.push(server.uuid.as_bytes().to_vec());
