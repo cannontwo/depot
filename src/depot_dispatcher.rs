@@ -87,7 +87,7 @@ impl AfterMiddleware for CorsMiddleware {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 enum ServerStatus {
     ONLINE = 0,
     OFFLINE = 1,
@@ -433,38 +433,33 @@ fn make_config(name: &'static str, body: &'static str) -> Uuid {
 fn purge_workers() {
     // Deadlock prevented in other threads, not considered in main
     if let Ok(mut expiry_guard) = EXPIRIES.lock() {
-        if let Ok(mut list_guard) = READY_SERVERS.lock() {
+        if let Ok(mut server_guard) = SERVERS.lock() {
             let now = std::time::Instant::now();
 
             // Update statuses
-            for id in list_guard.iter() {
-                let expiry: &mut Expiry = expiry_guard.get_mut(id).unwrap();
-                if expiry.instant < now {
+            for (id, server) in server_guard.iter_mut() {
+                let expiry: &mut Expiry = expiry_guard.get_mut(&id).unwrap();
+                if expiry.instant < now && server.status != ServerStatus::OFFLINE {
                     if expiry.liveness == 0 {
                         println!("D: Discarding worker {}", id);
-                        if let Ok(mut server_guard) = SERVERS.lock() {
-                            let entry: &mut Server = server_guard.get_mut(id).unwrap();
-                            entry.status = ServerStatus::OFFLINE;
+                        server.status = ServerStatus::OFFLINE;
 
-                            if let Some(config_uuid) = entry.config {
-                                if let Ok(mut config_guard) = CONFIGS.lock() {
-                                    if let Some(config) = config_guard.get_mut(&config_uuid) {
-                                        // If server doing config went down and config was not done, reclaim
-                                        if !config.status.done {
-                                            // Reset config status
-                                            config.status = Status::new();
-                                            if let Ok(mut config_list_guard) = READY_CONFIGS.lock() {
-                                                config_list_guard.push(config.uuid.clone())
-                                            }
-                                            println!("D: Reclaimed config {:?}", config.uuid);
+                        if let Some(config_uuid) = server.config {
+                            if let Ok(mut config_guard) = CONFIGS.lock() {
+                                if let Some(config) = config_guard.get_mut(&config_uuid) {
+                                    // If server doing config went down and config was not done, reclaim
+                                    if !config.status.done {
+                                        // Reset config status
+                                        config.status = Status::new();
+                                        if let Ok(mut config_list_guard) = READY_CONFIGS.lock() {
+                                            config_list_guard.push(config.uuid.clone())
                                         }
+                                        println!("D: Reclaimed config {:?}", config.uuid);
                                     }
-                                } else {
-                                    panic!("Couldn't lock CONFIGS");
                                 }
+                            } else {
+                                panic!("Couldn't lock CONFIGS");
                             }
-                        } else {
-                            panic!("Couldn't lock SERVERS");
                         }
                     } else {
                         println!("I: Reducing liveness of worker {}", id);
@@ -473,14 +468,17 @@ fn purge_workers() {
                     }
                 }
             }
-
-            // Purge from ready list
-            list_guard.retain(|id| {
-                let expiry = expiry_guard.get(id).unwrap();
-                expiry.instant > now || expiry.liveness != 0
-            });
+            if let Ok(mut list_guard) = READY_SERVERS.lock() {
+                // Purge from ready list
+                list_guard.retain(|id| {
+                    let expiry = expiry_guard.get(id).unwrap();
+                    expiry.instant > now || expiry.liveness != 0
+                });
+            } else {
+                panic!("Couldn't lock READY_SERVERS");
+            }
         } else {
-            panic!("Couldn't lock READY_SERVERS");
+            panic!("Couldn't lock SERVERS");
         }
     } else {
         panic!("Couldn't lock EXPIRIES");
