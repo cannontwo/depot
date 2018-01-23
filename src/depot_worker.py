@@ -136,12 +136,11 @@ def main():
             print("D: Got config message with name {}".format(config_msg.name))
 
             try:
-                configs = yaml.load(config_msg.body)
-                config = configs[0]
+                config = yaml.load(config_msg.body)
                 print("D: Parsed YAML config body: {}".format(config))
 
-                if config.has_key("experiment"):
-                    if config.has_key("num_episodes"):
+                if "experiment" in config:
+                    if "num_episodes" in config["experiment"]:
                         num_eps = config["experiment"]["num_episodes"]
                         print("D: Got config with {} episodes", num_eps)
                         CURRENT_MAX_EP_NUM = num_eps
