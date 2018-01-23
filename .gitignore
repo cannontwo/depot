@@ -20,3 +20,5 @@ src/proto
 **.DS_Store
 
 **.swp
+
+**/__pycache__

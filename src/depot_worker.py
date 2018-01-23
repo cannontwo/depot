@@ -18,6 +18,7 @@ CURRENT_MAX_EP_NUM = 0
 CURRENT_CONFIG = None
 
 
+# Spawn and manage Docker container running experiment.
 def start_docker(num_eps):
     global CURRENT_CONFIG
 
@@ -33,26 +34,20 @@ def start_docker(num_eps):
     for line in container.logs(stream=True):
         print(line)
 
+    ## Previous way of executing experiment runner; could be a better way to do this.
     # exec_stream = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
     #                                  'python /home/cannon/reinforcement_learning/rl_agents/python/experiment_runner.py"',
     #                                  stream=True)
-    # for line in exec_stream:
-    #     print(line)
 
     container.stop()
 
 
-# Spin to simulate work
-# TODO: Replace with communication with Docker container
+# Function to do work by spinning up Docker container and talking to it via ZMQ.
 def do_work(num_eps):
     global CURRENT_EP_NUM
 
-    # for i in range(num_eps):
-    #     print("Doing work episode {}".format(i))
-    #     CURRENT_EP_NUM = i
-    #     time.sleep(0.01)
-
     # Start Docker container in new thread
+    # TODO: Figure out how best to get whole config to Docker container.
     t = Thread(target=start_docker, args=(num_eps,))
     t.start()
 
@@ -65,6 +60,7 @@ def do_work(num_eps):
         print("Received {} on iteration {}".format(string, i))
         CURRENT_EP_NUM = int(string)
         time.sleep(0.01)
+
 
 # Send report message
 def send_report(socket, identity):
