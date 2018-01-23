@@ -4,6 +4,7 @@ import time
 import zmq
 import uuid
 import yaml
+import docker
 from threading import Thread, Lock
 from urllib.request import urlopen
 
@@ -17,14 +18,52 @@ CURRENT_MAX_EP_NUM = 0
 CURRENT_CONFIG = None
 
 
+def start_docker(num_eps):
+    global CURRENT_CONFIG
+
+    print("Spawning Docker container")
+
+    client = docker.from_env(version="auto")
+    container = client.containers.run("zmq_test", command=str(num_eps), detach=True,
+                                      volumes={'test': {'bind': '/test', 'mode': 'rw'}},
+                                      ports={5555: 5555})
+
+    time.sleep(20)
+
+    for line in container.logs(stream=True):
+        print(line)
+
+    # exec_stream = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
+    #                                  'python /home/cannon/reinforcement_learning/rl_agents/python/experiment_runner.py"',
+    #                                  stream=True)
+    # for line in exec_stream:
+    #     print(line)
+
+    container.stop()
+
+
 # Spin to simulate work
-# TODO: Replace with robot code
+# TODO: Replace with communication with Docker container
 def do_work(num_eps):
     global CURRENT_EP_NUM
 
+    # for i in range(num_eps):
+    #     print("Doing work episode {}".format(i))
+    #     CURRENT_EP_NUM = i
+    #     time.sleep(0.01)
+
+    # Start Docker container in new thread
+    t = Thread(target=start_docker, args=(num_eps,))
+    t.start()
+
+    context = zmq.Context(1)
+    receiver = context.socket(zmq.PULL)
+    receiver.connect("tcp://localhost:5555")
+
     for i in range(num_eps):
-        print("Doing work episode {}".format(i))
-        CURRENT_EP_NUM = i
+        string = receiver.recv_string()
+        print("Received {} on iteration {}".format(string, i))
+        CURRENT_EP_NUM = int(string)
         time.sleep(0.01)
 
 # Send report message
