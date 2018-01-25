@@ -19,25 +19,25 @@ CURRENT_CONFIG = None
 
 
 # Spawn and manage Docker container running experiment.
-def start_docker(num_eps):
+def start_docker():
     global CURRENT_CONFIG
 
     print("Spawning Docker container")
 
     client = docker.from_env(version="auto")
-    container = client.containers.run("zmq_test", command=str(num_eps), detach=True,
+    container = client.containers.run("cannon/testing", detach=True,
                                       volumes={'test': {'bind': '/test', 'mode': 'rw'}},
                                       ports={5555: 5555})
 
     time.sleep(20)
 
-    for line in container.logs(stream=True):
-        print(line)
+    # Previous way of executing experiment runner; could be a better way to do this.
+    exec_stream = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
+                                  'python /home/cannon/reinforcement_learning/rl_agents/python/experiment_runner.py"',
+                                  stream=True)
 
-    ## Previous way of executing experiment runner; could be a better way to do this.
-    # exec_stream = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
-    #                                  'python /home/cannon/reinforcement_learning/rl_agents/python/experiment_runner.py"',
-    #                                  stream=True)
+    for line in exec_stream:
+        print(line)
 
     container.stop()
 
@@ -45,10 +45,13 @@ def start_docker(num_eps):
 # Function to do work by spinning up Docker container and talking to it via ZMQ.
 def do_work(num_eps):
     global CURRENT_EP_NUM
+    global CURRENT_CONFIG
+
+    with open("/var/lib/docker/volumes/test/_data/config.yaml", "w") as config_file:
+        config_file.write(CURRENT_CONFIG.body)
 
     # Start Docker container in new thread
-    # TODO: Figure out how best to get whole config to Docker container.
-    t = Thread(target=start_docker, args=(num_eps,))
+    t = Thread(target=start_docker)
     t.start()
 
     context = zmq.Context(1)
