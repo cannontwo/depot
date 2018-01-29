@@ -39,7 +39,8 @@ def start_docker():
     for line in exec_stream:
         print(line)
 
-    container.stop()
+    container.kill()
+    time.sleep(20)
 
 
 # Function to do work by spinning up Docker container and talking to it via ZMQ.
@@ -180,7 +181,7 @@ def main():
                 if "experiment" in config:
                     if "num_episodes" in config["experiment"]:
                         num_eps = config["experiment"]["num_episodes"]
-                        print("D: Got config with {} episodes", num_eps)
+                        print("D: Got config with {} episodes".format(num_eps))
                         CURRENT_MAX_EP_NUM = num_eps
                         t = Thread(target=do_work, args=(num_eps,))
                         t.start()
