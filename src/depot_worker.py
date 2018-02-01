@@ -32,7 +32,7 @@ def start_docker():
     time.sleep(20)
 
     # Previous way of executing experiment runner; could be a better way to do this.
-    exec_stream = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
+    (code, exec_stream) = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
                                   'python /home/cannon/reinforcement_learning/rl_agents/python/experiment_runner.py"',
                                   stream=True)
 
