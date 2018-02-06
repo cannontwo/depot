@@ -112,11 +112,11 @@ def main():
 
     receiver = context.socket(zmq.DEALER)
     receiver.setsockopt(zmq.IDENTITY, identity.bytes)
-    receiver.connect("tcp://localhost:5557")
+    receiver.connect("tcp://rrl-exp.duckdns.org:5557")
 
     statistics = context.socket(zmq.PUB)
     statistics.setsockopt(zmq.IDENTITY, identity.bytes)
-    statistics.connect("tcp://localhost:5558")
+    statistics.connect("tcp://rrl-exp.duckdns.org:5558")
 
     print("I: Starting worker {} ({})".format(identity, identity.bytes))
 
@@ -131,7 +131,7 @@ def main():
     init_msg.append(type_part.SerializeToString())
 
     init = depot.ServerInit()
-    init.name = "localhost"  # TODO: Take in name as parameter
+    init.name = ip_string  # TODO: Take in name as parameter
     init.ip = ip_string
     init_msg.append(init.SerializeToString())
 
