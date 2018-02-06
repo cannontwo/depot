@@ -345,7 +345,7 @@ fn start_web_server() {
     let cors_middleware = CorsMiddleware {};
     chain.link_after(cors_middleware);
 
-    Iron::new(chain).http("localhost:4000").unwrap();
+    Iron::new(chain).http("0.0.0.0:4000").unwrap();
     println!("Server started at port 4000");
 }
 
