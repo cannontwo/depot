@@ -32,14 +32,15 @@ def start_docker():
     time.sleep(20)
 
     # Previous way of executing experiment runner; could be a better way to do this.
-    exec_stream = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
+    (code, exec_stream) = container.exec_run('/bin/bash -c "source /home/cannon/rl_wksp/devel/setup.bash; '
                                   'python /home/cannon/reinforcement_learning/rl_agents/python/experiment_runner.py"',
                                   stream=True)
 
     for line in exec_stream:
         print(line)
 
-    container.stop()
+    container.kill()
+    time.sleep(20)
 
 
 # Function to do work by spinning up Docker container and talking to it via ZMQ.
@@ -113,11 +114,11 @@ def main():
 
     receiver = context.socket(zmq.DEALER)
     receiver.setsockopt(zmq.IDENTITY, identity.bytes)
-    receiver.connect("tcp://localhost:5557")
+    receiver.connect("tcp://rrl-exp.duckdns.org:5557")
 
     statistics = context.socket(zmq.PUB)
     statistics.setsockopt(zmq.IDENTITY, identity.bytes)
-    statistics.connect("tcp://localhost:5558")
+    statistics.connect("tcp://rrl-exp.duckdns.org:5558")
 
     print("I: Starting worker {} ({})".format(identity, identity.bytes))
 
@@ -132,7 +133,7 @@ def main():
     init_msg.append(type_part.SerializeToString())
 
     init = depot.ServerInit()
-    init.name = "localhost"  # TODO: Take in name as parameter
+    init.name = ip_string  # TODO: Take in name as parameter
     init.ip = ip_string
     init_msg.append(init.SerializeToString())
 
@@ -182,7 +183,7 @@ def main():
                 if "experiment" in config:
                     if "num_episodes" in config["experiment"]:
                         num_eps = config["experiment"]["num_episodes"]
-                        print("D: Got config with {} episodes", num_eps)
+                        print("D: Got config with {} episodes".format(num_eps))
                         CURRENT_MAX_EP_NUM = num_eps
                         t = Thread(target=do_work, args=(num_eps,))
                         t.start()

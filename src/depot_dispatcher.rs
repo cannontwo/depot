@@ -54,8 +54,8 @@ const DEFAULT_BODY_STRING: &str = "agent:
     discount_factor: 0.98
     buffer_size: 1000000
     batch_size: 64
-    num_motion_planned: 64
-    num_demonstrations: 100
+    num_motion_planned: 0
+    num_demonstrations: 0
     num_joints: 6
     exploration_rate: 0.01
     tau: 0.05
@@ -64,7 +64,6 @@ const DEFAULT_BODY_STRING: &str = "agent:
     use_random_goal: True
     planning_group: manipulator
     critic_hidden_layers:
-        - 300
     actor_hidden_layers:
         - 300
 
@@ -346,7 +345,7 @@ fn start_web_server() {
     let cors_middleware = CorsMiddleware {};
     chain.link_after(cors_middleware);
 
-    Iron::new(chain).http("localhost:4000").unwrap();
+    Iron::new(chain).http("0.0.0.0:4000").unwrap();
     println!("Server started at port 4000");
 }
 
