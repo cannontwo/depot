@@ -65,6 +65,8 @@ def do_work(num_eps):
         CURRENT_EP_NUM = int(string)
         time.sleep(0.01)
 
+    receiver.close()
+
 
 # Send report message
 def send_report(socket, identity):
