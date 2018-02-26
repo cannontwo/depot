@@ -16,11 +16,13 @@ HEARTBEAT_INTERVAL = 1000
 CURRENT_EP_NUM = 0
 CURRENT_MAX_EP_NUM = 0
 CURRENT_CONFIG = None
+KILL_DOCKER = False
 
 
 # Spawn and manage Docker container running experiment.
 def start_docker():
     global CURRENT_CONFIG
+    global KILL_DOCKER
 
     print("Spawning Docker container")
 
@@ -39,7 +41,11 @@ def start_docker():
     for line in exec_stream:
         print(line)
 
-    container.kill()
+        # Since the docker container will keep running forever, we need to signal it.
+        if KILL_DOCKER:
+            container.kill()
+            KILL_DOCKER = False
+
     time.sleep(20)
 
 
@@ -47,6 +53,7 @@ def start_docker():
 def do_work(num_eps):
     global CURRENT_EP_NUM
     global CURRENT_CONFIG
+    global KILL_DOCKER
 
     with open("/var/lib/docker/volumes/test/_data/config.yaml", "w") as config_file:
         config_file.write(CURRENT_CONFIG.body)
@@ -64,6 +71,9 @@ def do_work(num_eps):
         print("Received {} on iteration {}".format(string, i))
         CURRENT_EP_NUM = int(string)
         time.sleep(0.01)
+
+    # If we are here, then work has finished
+    KILL_DOCKER = True
 
     receiver.close()
 
